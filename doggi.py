@@ -23,7 +23,8 @@ import dns.exception
 import requests
 
 # --- Config / constants ---
-DEFAULT_SERVER = "tls://1.1.1.1"  # DoT по умолчанию
+# DEFAULT_SERVER = "tls://1.1.1.1"  # DoT по умолчанию
+DEFAULT_SERVER = "1.1.1.1"
 DNS_PORT_DEFAULT = 53
 DOT_PORT_DEFAULT = 853
 DOH_PORT_DEFAULT = 443
@@ -453,18 +454,27 @@ def format_nameserver_for_header(spec: ServerSpec, original: str) -> str:
 def format_row(ttl: int, ip: str, country: str, city: str, asn: str, partial: bool = False) -> str:
     """
     Форматирует строку таблицы с заданными ширинами. Partial: только TTL + IP, остальное пусто.
+    Если partial=True, возвращаем строку БЕЗ хвостовых пробелов (только TTL и IP),
+    чтобы избежать переноса строки в узких терминалах, который ломает \r.
     """
-    if partial:
-        country = ''
-        city = ''
-        asn = ''
     ttl_str = f"{ttl:4d}"
-    return (
+    
+    # Сначала формируем начало строки
+    row_start = (
         f"{ttl_str:>{COL_WIDTHS['TTL']}}  "
-        f"{ip:<{COL_WIDTHS['IP']}}  "
+        f"{ip:<{COL_WIDTHS['IP']}}"
+    )
+    
+    if partial:
+        # Для частичного вывода возвращаем только это, без длинного паддинга справа
+        return row_start
+
+    # Для полного вывода добавляем остальное
+    return (
+        f"{row_start}  "
         f"{country:<{COL_WIDTHS['Country']}}  "
         f"{city:<{COL_WIDTHS['City']}}  "
-        f"{asn:<{COL_WIDTHS['ASN']}}"
+        f"{asn}"
     )
 
 
