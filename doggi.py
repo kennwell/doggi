@@ -492,20 +492,62 @@ def print_header():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="doggi: DNS resolver with DoH/DoT and online geo (IPGeolocation + IPInfo)"
+        description="doggi: DNS resolver with DoH/DoT and online geo (IPInfo)"
     )
-    parser.add_argument(
-        "server",
-        nargs="?",
-        default=DEFAULT_SERVER,
-        help="DNS server (first arg, optional @). Examples: @194.58.44.150:54 | @[2605:e440:2::3:272]:54 | @tls://nl2.ogne.top:854 | @https://nl2.ogne.top:8443/dns-query | @https://dns.google/resolve",
-    )
-    parser.add_argument("domain", help="Domain to resolve (second arg, e.g., ya.ru)")
+    
+    # Группа флагов выбора сервера (взаимоисключающие)
+    server_group = parser.add_mutually_exclusive_group()
+    server_group.add_argument("-d", action="store_true", help="Use default UDP server (1.1.1.1)")
+    server_group.add_argument("-s", action="store_true", help="Use default DoT server (tls://1.1.1.1)")
+    server_group.add_argument("-m", action="store_true", help="Use MSC DoH server (https://msc.ogne.top/dns-query)")
+
+    # Позиционные аргументы (домен, либо сервер + домен)
+    parser.add_argument("args", nargs="+", help="Domain to resolve (e.g. ya.ru), or Server + Domain")
+
     args = parser.parse_args()
 
-    domain = args.domain.strip()
-    server_raw = args.server.strip() if args.server else DEFAULT_SERVER
+    # Определение сервера
+    server_raw = DEFAULT_SERVER  # По умолчанию 1.1.1.1 (после правки в конфиге)
 
+    if args.d:
+        server_raw = "1.1.1.1" 
+    elif args.s:
+        # Для -s явно используем tls://1.1.1.1
+        server_raw = "tls://1.1.1.1"
+    elif args.m:
+        server_raw = "https://msc.ogne.top/dns-query"
+    
+    # Разбор позиционных аргументов
+    # Если флаг был задан, ожидаем только домен в args (1 шт)
+    # Если флаг НЕ задан, то:
+    #   1 аргумент -> это домен (сервер = default)
+    #   2 аргумента -> 1-й сервер, 2-й домен (старое поведение)
+    
+    has_flag = args.d or args.s or args.m
+    positional = args.args
+
+    if has_flag:
+        # При активном флаге берем последний аргумент как домен (игнорируя лишние, если пользователь ошибся)
+        # doggi -s ya.ru -> positional=['ya.ru']
+        # doggi ya.ru -s -> positional=['ya.ru']
+        if len(positional) >= 1:
+            domain = positional[0]
+        else:
+            parser.error("Domain is required")
+    else:
+        # Флагов нет
+        if len(positional) == 1:
+            domain = positional[0]
+            # server_raw уже DEFAULT_SERVER
+        elif len(positional) >= 2:
+            server_raw = positional[0]
+            domain = positional[1]
+        else:
+            parser.error("Domain is required")
+
+    domain = domain.strip()
+    server_raw = server_raw.strip()
+    
     # Резолвим A/AAAA
     records, spec = resolve_dns(domain, server_raw)
 
