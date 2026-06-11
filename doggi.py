@@ -4,7 +4,6 @@
 import os
 import sys
 import argparse
-import urllib3  # Для подавления insecure warnings
 from typing import List, Tuple, Dict, Set
 from urllib.parse import urlparse, urlunparse, ParseResult
 import ipaddress
@@ -12,15 +11,12 @@ import socket
 import subprocess
 import json
 
-# Подавляем InsecureRequestWarning (только для verify=False в DoH fallback)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 import dns.message
 import dns.rdatatype
 import dns.resolver
 import dns.query
 import dns.exception
-import requests
+import httpx
 
 # --- Config / constants ---
 # DEFAULT_SERVER = "tls://1.1.1.1"  # DoT по умолчанию
@@ -296,62 +292,65 @@ def resolve_dot(domain: str, spec: ServerSpec) -> List[Tuple[int, str]]:
 
 def resolve_doh(domain: str, spec: ServerSpec) -> List[Tuple[int, str]]:
     """
-    Поддерживает два варианта DoH:
-    - binary endpoint (/dns-query): dns.query.https (если стандартный 443), fallback requests.post
-    - JSON endpoint (/resolve): requests.get
-    verify=False только для non-standard (custom port/path).
+    Единый транспорт на httpx с поддержкой HTTP/2.
+
+    Это принципиально: часть DoH-серверов (например, Yandex
+    common.dot.dns.yandex.net) отвечают ТОЛЬКО по HTTP/2 и рвут
+    HTTP/1.1-соединения (RemoteDisconnected). httpx с http2=True
+    закрывает эту проблему; requests/urllib3 (HTTP/1.1) — нет.
+
+    Два варианта эндпоинта:
+    - JSON (/resolve): GET ?name=&type=
+    - binary (/dns-query): POST application/dns-message
+    verify=False только для non-standard (custom port/path, напр. self-signed).
     """
     out: List[Tuple[int, str]] = []
     u = urlparse(spec.url)
-    hostname = u.hostname
     port = u.port or DOH_PORT_DEFAULT
     path = u.path or "/dns-query"
 
-    # JSON-эндпоинт (/resolve)
-    if spec.url.endswith("/resolve"):
-        def fetch_json(rdtype_name: str) -> None:
-            params = {"name": domain, "type": rdtype_name}
-            try:
-                r = requests.get(spec.url, params=params, timeout=10)
-                r.raise_for_status()
-                data = r.json()
-                answers = data.get("Answer", [])
-                for a in answers:
-                    t = a.get("type")
-                    if (rdtype_name == "A" and t == 1) or (rdtype_name == "AAAA" and t == 28):
-                        ttl = a.get("TTL", 0)
-                        ip = a.get("data", "")
-                        if ip:
-                            out.append((ttl, ip))
-            except Exception as e:
-                print(f"DNS {rdtype_name} via DoH(JSON) error: {e}", file=sys.stderr)
+    # Для нестандартных эндпоинтов (кастомный порт/путь, напр. :8443) часто
+    # self-signed сертификат — отключаем проверку только для них.
+    is_standard = (port == DOH_PORT_DEFAULT and path == "/dns-query")
+    verify_cert = is_standard
 
-        fetch_json("A")
-        fetch_json("AAAA")
-        return out
+    try:
+        with httpx.Client(http2=True, verify=verify_cert, timeout=10) as client:
+            # JSON-эндпоинт (/resolve)
+            if spec.url.endswith("/resolve"):
+                for rdtype_name in ("A", "AAAA"):
+                    try:
+                        r = client.get(spec.url, params={"name": domain, "type": rdtype_name})
+                        r.raise_for_status()
+                        data = r.json()
+                        for a in data.get("Answer", []):
+                            t = a.get("type")
+                            if (rdtype_name == "A" and t == 1) or (rdtype_name == "AAAA" and t == 28):
+                                ip = a.get("data", "")
+                                if ip:
+                                    out.append((a.get("TTL", 0), ip))
+                    except Exception as e:
+                        print(f"DNS {rdtype_name} via DoH(JSON) error [{type(e).__name__}]: {e!r}", file=sys.stderr)
+                return out
 
-    # Binary DoH: пробуем dns.query.https (только для 443 + /dns-query), fallback requests.post
-    use_dns_query = (port == DOH_PORT_DEFAULT and path == "/dns-query")
-    verify_cert = use_dns_query  # True для standard (secure), False для custom (e.g., 8443 self-signed)
-    for rdtype in ("A", "AAAA"):
-        try:
-            if use_dns_query:
-                q = dns.message.make_query(domain, rdtype)
-                resp = dns.query.https(q, where=hostname, timeout=10)  # where=str, port=443 auto
-                out.extend(_extract_from_dns_message(resp))
-            else:
-                raise ValueError("Non-standard")
-        except Exception as e:
-            # Fallback: requests POST (verify=False для custom)
-            try:
-                q = dns.message.make_query(domain, rdtype)
-                headers = {"Content-Type": "application/dns-message"}
-                r = requests.post(spec.url, data=q.to_wire(), headers=headers, timeout=10, verify=verify_cert)
-                r.raise_for_status()
-                resp = dns.message.from_wire(r.content)
-                out.extend(_extract_from_dns_message(resp))
-            except Exception as e2:
-                print(f"DNS {rdtype} via DoH error: {e2}", file=sys.stderr)
+            # Binary-эндпоинт (/dns-query): POST application/dns-message
+            headers = {
+                "content-type": "application/dns-message",
+                "accept": "application/dns-message",
+            }
+            for rdtype in ("A", "AAAA"):
+                try:
+                    q = dns.message.make_query(domain, rdtype)
+                    r = client.post(spec.url, content=q.to_wire(), headers=headers)
+                    r.raise_for_status()
+                    resp = dns.message.from_wire(r.content)
+                    out.extend(_extract_from_dns_message(resp))
+                except Exception as e:
+                    print(f"DNS {rdtype} via DoH error [{type(e).__name__}]: {e!r}", file=sys.stderr)
+    except Exception as e:
+        # Ошибка создания клиента/соединения (общая для обоих типов)
+        print(f"DoH client error [{type(e).__name__}]: {e!r}", file=sys.stderr)
+
     return out
 
 
@@ -499,7 +498,9 @@ def main():
     server_group = parser.add_mutually_exclusive_group()
     server_group.add_argument("-d", action="store_true", help="Use default UDP server (1.1.1.1)")
     server_group.add_argument("-s", action="store_true", help="Use default DoT server (tls://1.1.1.1)")
-    server_group.add_argument("-m", action="store_true", help="Use MSC DoH server (https://msc.ogne.top/dns-query)")
+    server_group.add_argument("-m", action="store_true", help="Use MSC DoH server (https://msc.ogne.top:443/dns-query)")
+    server_group.add_argument("-y", action="store_true", help="Use Yandex DoH server (https://common.dot.dns.yandex.net/dns-query)")
+    server_group.add_argument("-u", action="store_true", help="Use US DoH server (https://us.ogne.top:8443/dns-query)")
 
     # Позиционные аргументы (домен, либо сервер + домен)
     parser.add_argument("args", nargs="+", help="Domain to resolve (e.g. ya.ru), or Server + Domain")
@@ -515,7 +516,11 @@ def main():
         # Для -s явно используем tls://1.1.1.1
         server_raw = "tls://1.1.1.1"
     elif args.m:
-        server_raw = "https://msc.ogne.top/dns-query"
+        server_raw = "https://msc.ogne.top:443/dns-query"
+    elif args.y:
+        server_raw = "https://common.dot.dns.yandex.net/dns-query"
+    elif args.u:
+        server_raw = "https://us.ogne.top:8443/dns-query"
     
     # Разбор позиционных аргументов
     # Если флаг был задан, ожидаем только домен в args (1 шт)
@@ -523,7 +528,7 @@ def main():
     #   1 аргумент -> это домен (сервер = default)
     #   2 аргумента -> 1-й сервер, 2-й домен (старое поведение)
     
-    has_flag = args.d or args.s or args.m
+    has_flag = args.d or args.s or args.m or args.y or args.u
     positional = args.args
 
     if has_flag:
