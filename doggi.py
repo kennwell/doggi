@@ -509,6 +509,7 @@ def main():
     server_group.add_argument("-m", action="store_true", help="Use MSC DoH server (https://msc.ogne.top:443/dns-query)")
     server_group.add_argument("-y", action="store_true", help="Use Yandex DoH server (https://common.dot.dns.yandex.net/dns-query)")
     server_group.add_argument("-u", action="store_true", help="Use US DoH server (https://us.ogne.top:8443/dns-query)")
+    server_group.add_argument("-co", action="store_true", help="Use CO DoH server (https://co1.ogne.top:8443/dns-query)")
 
     # Позиционные аргументы (домен, либо сервер + домен)
     parser.add_argument("args", nargs="+", help="Domain to resolve (e.g. ya.ru), or Server + Domain")
@@ -529,14 +530,16 @@ def main():
         server_raw = "https://common.dot.dns.yandex.net/dns-query"
     elif args.u:
         server_raw = "https://us.ogne.top:8443/dns-query"
-    
+    elif args.co:
+        server_raw = "https://co1.ogne.top:8443/dns-query"
+
     # Разбор позиционных аргументов
     # Если флаг был задан, ожидаем только домен в args (1 шт)
     # Если флаг НЕ задан, то:
     #   1 аргумент -> это домен (сервер = default)
     #   2 аргумента -> 1-й сервер, 2-й домен (старое поведение)
     
-    has_flag = args.d or args.s or args.m or args.y or args.u
+    has_flag = args.d or args.s or args.m or args.y or args.u or args.co
     positional = args.args
 
     if has_flag:
