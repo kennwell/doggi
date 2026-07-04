@@ -162,7 +162,15 @@ def get_ns_records(domain: str) -> Set[str]:
     """
     ns_set: Set[str] = set()
     current_domain = domain
-    res = dns.resolver.Resolver()
+    # На macOS /etc/resolv.conf не содержит nameserver'ов, поэтому системная
+    # конфигурация может быть пустой (NoResolverConfiguration в свежей dnspython).
+    # Пробуем взять системные серверы, а при их отсутствии — публичный фолбэк.
+    try:
+        res = dns.resolver.Resolver()
+    except dns.resolver.NoResolverConfiguration:
+        res = dns.resolver.Resolver(configure=False)
+    if not res.nameservers:
+        res.nameservers = ['1.1.1.1', '8.8.8.8']
     res.timeout = 10
     res.lifetime = 10
 
