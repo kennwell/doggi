@@ -10,6 +10,7 @@ import ipaddress
 import socket
 import subprocess
 import json
+import re
 
 import dns.message
 import dns.rdatatype
@@ -20,6 +21,8 @@ import httpx
 
 # --- Config / constants ---
 # DEFAULT_SERVER = "tls://1.1.1.1"  # DoT по умолчанию
+# По умолчанию используется DNS-сервер из системной конфигурации;
+# DEFAULT_SERVER — это фолбэк на случай, когда системный определить не удалось.
 DEFAULT_SERVER = "1.1.1.1"
 DNS_PORT_DEFAULT = 53
 DOT_PORT_DEFAULT = 853
@@ -153,6 +156,53 @@ def parse_server(raw: str) -> ServerSpec:
     # UDP по умолчанию
     host, port = parse_udp_hostport(s)
     return ServerSpec(protocol="udp", host=host, port=port)
+
+
+def get_system_nameservers() -> List[str]:
+    """
+    Возвращает список DNS-серверов из системной конфигурации.
+
+    Порядок источников:
+    1. /etc/resolv.conf через dnspython (на macOS файл генерируется configd
+       и обычно содержит актуальный nameserver основного интерфейса);
+    2. `scutil --dns` — канонический источник на macOS. Берём ТОЛЬКО блок
+       "resolver #1" (основной резольвер): в общем выводе есть и scoped-резольверы
+       (VPN, второй интерфейс), чьи серверы к дефолтному трафику отношения не имеют;
+    3. DEFAULT_SERVER — если системную конфигурацию получить не удалось.
+    """
+    # 1. resolv.conf
+    try:
+        res = dns.resolver.Resolver()
+        if res.nameservers:
+            return [str(ns) for ns in res.nameservers]
+    except Exception:
+        # NoResolverConfiguration и прочие ошибки чтения — идём к следующему источнику
+        pass
+
+    # 2. scutil --dns, только resolver #1
+    try:
+        proc = subprocess.run(
+            ["scutil", "--dns"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        # Отрезаем всё после начала второго резольвера
+        blocks = proc.stdout.split("resolver #")
+        if len(blocks) > 1:
+            servers = re.findall(r"nameserver\[\d+\]\s*:\s*(\S+)", blocks[1])
+            uniq: List[str] = []
+            for ip in servers:
+                if ip not in uniq:
+                    uniq.append(ip)
+            if uniq:
+                return uniq
+    except Exception as e:
+        print(f"Cannot read system DNS via scutil: {type(e).__name__}", file=sys.stderr)
+
+    # 3. Фолбэк
+    return [DEFAULT_SERVER]
 
 
 def get_ns_records(domain: str) -> Set[str]:
@@ -504,7 +554,7 @@ def main():
     
     # Группа флагов выбора сервера (взаимоисключающие)
     server_group = parser.add_mutually_exclusive_group()
-    server_group.add_argument("-d", action="store_true", help="Use default UDP server (1.1.1.1)")
+    server_group.add_argument("-d", action="store_true", help="Use system DNS server (from system configuration; same as no flag)")
     server_group.add_argument("-s", action="store_true", help="Use default DoT server (tls://1.1.1.1)")
     server_group.add_argument("-m", action="store_true", help="Use MSC DoH server (https://msc.ogne.top:443/dns-query)")
     server_group.add_argument("-y", action="store_true", help="Use Yandex DoH server (https://common.dot.dns.yandex.net/dns-query)")
@@ -512,15 +562,21 @@ def main():
     server_group.add_argument("-co", action="store_true", help="Use CO DoH server (https://co1.ogne.top:8443/dns-query)")
 
     # Позиционные аргументы (домен, либо сервер + домен)
-    parser.add_argument("args", nargs="+", help="Domain to resolve (e.g. ya.ru), or Server + Domain")
+    parser.add_argument(
+        "args",
+        nargs="+",
+        help="Domain to resolve (e.g. ya.ru), or Server + Domain. "
+             "Without a server or flag the system DNS server is used",
+    )
 
     args = parser.parse_args()
 
-    # Определение сервера
-    server_raw = DEFAULT_SERVER  # По умолчанию 1.1.1.1 (после правки в конфиге)
+    # Определение сервера.
+    # None = сервер явно не задан => берём системный (это же делает флаг -d).
+    server_raw = None
 
     if args.d:
-        server_raw = "1.1.1.1" 
+        server_raw = None
     elif args.s:
         # Для -s явно используем tls://1.1.1.1
         server_raw = "tls://1.1.1.1"
@@ -554,12 +610,16 @@ def main():
         # Флагов нет
         if len(positional) == 1:
             domain = positional[0]
-            # server_raw уже DEFAULT_SERVER
+            # server_raw остаётся None => системный DNS
         elif len(positional) >= 2:
             server_raw = positional[0]
             domain = positional[1]
         else:
             parser.error("Domain is required")
+
+    # Сервер не задан ни флагом, ни позиционным аргументом — спрашиваем систему
+    if server_raw is None:
+        server_raw = get_system_nameservers()[0]
 
     domain = domain.strip()
     server_raw = server_raw.strip()
